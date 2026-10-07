@@ -88,13 +88,15 @@
 # Пул и DHCP-сервер. Диапазон ограничен 10 адресами (см. ниже).
 /ip pool add name=guest-pool ranges=192.168.77.10-192.168.77.19
 /ip dhcp-server add name=guest-dhcp interface=br-guest address-pool=guest-pool \
-    lease-time=1h disabled=no comment="Guest DHCP"
+    lease-time=1h disabled=no add-arp=yes comment="Guest DHCP"
 /ip dhcp-server network add address=192.168.77.0/24 gateway=192.168.77.1 dns-server=192.168.77.1
 ```
 
 Длинный `lease-time` гостям не нужен, час — разумно. DNS-сервером указываем сам роутер (см. шаг 6).
 
 Пул из 10 адресов — это второй рубеж ограничения числа устройств. Так как на `br-guest` включён `arp=reply-only`, устройство без DHCP-lease не получит ARP-ответов и работать не сможет, в том числе со статическим IP. То есть число одновременно работающих устройств жёстко ограничено размером пула. Основной рубеж — `max-clients` на уровне радио (шаг 2).
+
+> **Обязательно `add-arp=yes` на гостевом DHCP-сервере.** `arp=reply-only` на мосте запрещает динамическое изучение MAC-адресов, поэтому роутер обязан брать MAC клиентов из DHCP-lease. Без `add-arp=yes` гость получит адрес (DHCP — это broadcast, ему ARP не нужен), но роутер не сможет доставить ему обратные пакеты: пропадут ответы DNS, ICMP-эхо и весь download. Симптомы: «интернет не работает» и долгий таймаут, при этом в `/ip dhcp-server lease` lease есть, счётчики `guest: internet` в firewall растут в обе стороны, а `/ip arp print` **пуст для гостевого интерфейса**. Проверка — `ping` до гостя **с роутера**: `timeout`. Это самая частая ошибка в такой схеме.
 
 ---
 
@@ -107,7 +109,7 @@
 /interface/wifi/security add name=sec-guest \
     authentication-types=wpa2-psk,wpa3-psk \
     passphrase="ЗАМЕНИТЕ_НА_ПАРОЛЬ" \
-    wps=disabled
+    wps=disable
 
 # Профиль datapath: отдельный bridge + изоляция клиентов
 /interface/wifi/datapath add name=dp-guest \
@@ -117,7 +119,7 @@
 # Профиль конфигурации: SSID, страна, максимум клиентов, привязка профилей
 /interface/wifi/configuration add name=conf-guest \
     ssid="Guest-WiFi" \
-    country=russia \
+    country=Russia \
     max-clients=10 \
     security=sec-guest \
     datapath=dp-guest
@@ -129,7 +131,8 @@
     comment="Guest AP"
 ```
 
-- `country` укажите своей страны (нижним регистром, например `russia`, `latvia`, `germany`).
+- `country` укажите своей страны. В RouterOS 7.24 значение пишется **с заглавной буквы** (`Russia`, `Latvia`, `Germany`); `russia` строчными вызовет ошибку. При необходимости проверьте допустимые значения в `/interface/wifi/radio print detail` (`current-country`).
+- Свойства-значения проверяйте по факту: в актуальных версиях `wps=disabled` → **`wps=disable`** (иначе syntax error).
 - `max-clients=10` — не более 10 одновременно подключённых устройств: 11-й клиент не сможет ассоциироваться с точкой ещё до выдачи IP.
 - Пароль сгенерируйте стойкий, например:
   ```bash
@@ -138,6 +141,32 @@
   Символы `\ ; , : "` в пароле и SSID допустимы (скрипт QR их корректно экранирует), но проще их не использовать.
 
 Если у вас две радиоточки (2.4 и 5 ГГц) и вы хотите гостевой SSID на обеих — повторите создание интерфейса с `master-interface=wifi2` под другим именем (например, `wifi-guest-2`), используя те же профили.
+
+### Вариант: гость на отдельном радио (например, только 2.4 ГГц), без виртуального AP
+
+Если гостевой SSID должен жить **на самом радиомодуле** (например, отдать под гостя весь диапазон 2.4 ГГц, интерфейс `wifi2`), то `wifi2` выступает гостевой точкой напрямую, а виртуальный AP не создаётся. Настройка та же (профили `sec-guest`, `dp-guest`, `conf-guest`), но интерфейс не добавляется через `/interface/wifi add`, а конфигурируется существующий:
+
+```rsc
+/interface wifi set wifi2 \
+    disabled=no \
+    configuration=conf-guest \
+    channel.band=2ghz-ax channel.width=20/40mhz
+```
+
+Важные отличия от виртуального AP:
+
+- **`disabled=no` обязателен.** После `reset`/восстановления бэкапа физический `wifi2` бывает выключен (`MBX`), и тогда «сеть пропала».
+- **Канал задавайте inline** (`channel.band=2ghz-ax`, `channel.width=20/40mhz`) — как в заводском дефконфиге. Профиль `/interface/wifi/channel` не обязателен; если создаёте его, задавайте `band` и (при желании) `frequency`.
+- **Мост — статическим портом**, а не через `datapath.bridge`. Для этого варианта создавайте `dp-guest` **без** `bridge=` (в блоке шага 2 просто опустите `bridge=br-guest`) и добавьте порт вручную:
+
+  ```rsc
+  /interface/wifi/datapath add name=dp-guest client-isolation=yes
+  /interface bridge port set [find interface=wifi2] bridge=br-guest
+  ```
+
+  `datapath.bridge` на мастер-интерфейсе создаёт **динамический** порт в мосту (он бывает в состоянии INACTIVE); статический порт надёжнее.
+
+Основное радио (`wifi1`) при этом продолжает раздавать основную сеть — диапазоны не конфликтуют.
 
 ---
 
@@ -170,38 +199,54 @@ add chain=input action=accept in-interface-list=guest protocol=tcp dst-port=53 \
 
 ### 4.2. Forward: изоляция и интернет (chain forward)
 
-Нужно запретить гостям основную подсеть и общение между собой, разрешить интернет — и при этом **исключить гостевой трафик из FastTrack**, иначе ограничение скорости из шага 7 работать не будет (FastTrack обходит очереди).
+Нужно запретить гостям локальные подсети (включая основную), разрешить интернет — и **исключить гостевой трафик из FastTrack**, иначе ограничение скорости из шага 7 не заработает (FastTrack обходит очереди).
 
-Правила добавляются в начало списка (`place-before=0`), каждая следующая команда вставляется выше предыдущей — поэтому в итоге сверху окажутся именно они, в нужном порядке:
+Сначала соберите список локальных подсетей, куда гостю нельзя. Внесите туда **все** свои локальные сети: основную LAN, гостевую, подсети контейнеров/VLAN, а также подсеть со стороны WAN-аплинка и адреса VPN-туннелей — иначе гость сможет через роутер достучаться до аплинка или внутренних сетей VPN:
+
+```rsc
+/ip firewall address-list
+add list=guest-blocked address=192.168.88.0/24 comment="main LAN"
+add list=guest-blocked address=192.168.77.0/24 comment="guest subnet"
+add list=guest-blocked address=192.168.89.0/24 comment="container"
+add list=guest-blocked address=192.168.1.0/24 comment="WAN uplink"
+add list=guest-blocked address=10.99.0.0/30 comment="vpn transit"
+add list=guest-blocked address=10.8.2.5/32 comment="vpn endpoint"
+```
+
+затем сами правила:
 
 ```rsc
 /ip firewall filter
+add chain=forward action=drop in-interface-list=guest dst-address-list=guest-blocked \
+    comment="guest: drop to local subnets" place-before=0
+add chain=forward action=accept in-interface-list=guest out-interface-list=WAN \
+    comment="guest: internet upload (no fasttrack)" place-before=0
 add chain=forward action=accept out-interface-list=guest \
     comment="guest: internet download (no fasttrack)" place-before=0
-add chain=forward action=accept in-interface-list=guest \
-    comment="guest: internet upload (no fasttrack)" place-before=0
-add chain=forward action=drop in-interface-list=guest dst-address=192.168.77.0/24 \
-    comment="guest: drop to guest subnet" place-before=0
-add chain=forward action=drop in-interface-list=guest dst-address=192.168.88.0/24 \
-    comment="guest: drop to LAN" place-before=0
 ```
+
+Про `place-before=0`: правила ложатся в начало списка **блоком в порядке добавления** (а не «каждая следующая выше предыдущей», как иногда пишут). Поэтому добавляйте их ровно в том порядке, в котором они должны идти сверху вниз, и сверяйтесь с выводом.
+
+Условие `out-interface-list=WAN` у upload-правила — страховка: оно сужает «интернет-upload» до выхода в интернет, поэтому даже при перепутанном порядке гость, идущий в локальную сеть, не попадёт под `accept`, а сработает `drop`. Так изоляция не зависит от взаимного порядка двух правил.
 
 Проверьте результат:
 
 ```rsc
-/ip firewall filter print where chain=forward
+/ip firewall filter print
 ```
 
 Сверху должны быть, по порядку:
 
-1. `guest: drop to LAN`
-2. `guest: drop to guest subnet`
+1. `guest: DHCP`, `guest: DNS udp`, `guest: DNS tcp` (цепочка input)
+2. `guest: drop to local subnets`
 3. `guest: internet upload (no fasttrack)`
 4. `guest: internet download (no fasttrack)`
 
 …и только затем идут дефолтные правила, включая `fasttrack-connection`.
 
-> Если у вас есть другие локальные подсети — добавьте для них такие же `drop`-правила перед `accept`-правилами.
+> **Порядок `drop` критичен.** Правило `accept in-interface-list=guest` без ограничения по `out-interface` пропускает *любой* исходящий от гостя трафик, в том числе в LAN. Поэтому либо `drop` идёт раньше, либо `accept` сужается до `out-interface-list=WAN` (как выше).
+
+> Если на роутере уже есть свои forward-правила сверху (например, блокировка рекламы), учтите, что правила гостя вставятся **выше** и перекроют их для гостевого трафика.
 
 ---
 
@@ -246,15 +291,19 @@ add chain=forward action=drop in-interface-list=guest dst-address=192.168.88.0/2
 
 ### 7.1. Метки пакетов (mangle)
 
+Метим пакеты по направлению относительно гостевого списка интерфейсов — **без** `connection-mark`:
+
 ```rsc
 /ip firewall mangle
-add chain=forward action=mark-connection connection-mark=no-mark in-interface-list=guest \
-    new-connection-mark=guest-conn comment="guest: mark connection"
-add chain=forward action=mark-packet connection-mark=guest-conn in-interface-list=guest \
-    new-packet-mark=guest-upload passthrough=no comment="guest: mark upload"
-add chain=forward action=mark-packet connection-mark=guest-conn out-interface-list=guest \
-    new-packet-mark=guest-download passthrough=no comment="guest: mark download"
+add chain=forward action=mark-packet new-packet-mark=guest-upload passthrough=no \
+    in-interface-list=guest comment="guest: mark upload"
+add chain=forward action=mark-packet new-packet-mark=guest-download passthrough=no \
+    out-interface-list=guest comment="guest: mark download"
 ```
+
+> Почему без `connection-mark`: если на роутере уже есть VPN, он метит соединения (например, `to_vpn_mark`) и маршрутизирует их в отдельную таблицу. Отдельные гостевые `connection-mark` могут с этим конфликтовать и приводить к тому, что часть трафика пойдёт мимо очередей. Метки **пакетов** по `interface-list` для PCQ вполне достаточно и ни с чем не пересекается.
+>
+> Если на роутере есть mangle-правила `change-mss` (клэмпинг MSS для VPN), добавляйте гостевые метки **после** них.
 
 ### 7.2. Типы очередей PCQ
 
@@ -354,6 +403,11 @@ python3 wifi_qr.py --ssid "Guest-WiFi" --password "ВАШ_ПАРОЛЬ" -o guest
 - **Скрытие SSID** (`hide-ssid=yes`) не является защитой — используйте пароль и WPA2/WPA3.
 - **IPv6.** Если у провайдера есть IPv6 и он раздаётся в LAN, гости его не получат (мы не настраивали IPv6 на `br-guest`). Убедитесь, что гостевой трафик не получит доступ к локальным IPv6-адресам: при необходимости добавьте аналогичные правила в `/ipv6 firewall filter`.
 - **Не добавляйте `br-guest` в interface list `LAN`.**
+- **Флаги wifi-интерфейса.** `/interface/wifi print` показывает: `MBR` — работает и есть клиенты; `MB` — работает, клиентов нет; `MBI` — **inactive, не вещает**; `MBX` — выключен (`disabled=no`, чтобы включить). Флаг `I` на wifi-порте в `/interface bridge port print` при отсутствии клиентов — норма, а не ошибка.
+- **Не запускайте `/interface/wifi scan` и `/interface/wifi frequency-scan` через «одноразовый» SSH** (ssh с командой в аргументе). Сканирование «зависает» и держит радио занятым несколько минут, роняя всех клиентов. Для диагностики используйте `monitor`, `registration-table`, `print`.
+- **Если радио «залипло»** (SSID не виден никому, при этом `monitor` рапортует `running`, а флаг интерфейса `MBI`): это не лечится перебором настроек. Помогает **заводской сброс** или **холодный старт** (снять и подать питание); обычный `/system reboot` может не помочь. Наблюдалось на `wifi-qcom` (hAP ax³, RouterOS 7.24.x).
+- **Сброс и бэкапы.** `/interface/wifi reset <iface>` возвращает интерфейс к дефолту и **выключает** его — не забудьте `disabled=no` и заново задать SSID/канал. При восстановлении бэкапа из командной строки в 7.24 синтаксис `/system backup load name=<файл> password=""` требует явного `password` даже для незапароленного файла.
+- **Значения по умолчанию.** После задания профиля (`configuration=` и т.п.) inline-свойства интерфейса имеют **приоритет** над профилем. Снимать свойство следует синтаксисом `!имя` (например `!datapath !channel`), а не `set имя=""` — пустое значение подставляет первый существующий профиль.
 - **Несколько точек доступа / CAPsMAN.** В этой инструкции изоляция сделана отдельным bridge. Если гостевой SSID должен раздаваться несколькими AP через провод, вместо `datapath.bridge` используйте VLAN: `datapath.vlan-id=<id>` и VLAN-транк на uplink, по образцу из официальной документации MikroTik (WiFi → CAPsMAN VLAN example).
 
 ## Откат
@@ -370,6 +424,7 @@ python3 wifi_qr.py --ssid "Guest-WiFi" --password "ВАШ_ПАРОЛЬ" -o guest
 /queue type remove [find where name~"guest-"]
 /ip firewall mangle remove [find where comment~"guest:"]
 /ip firewall filter remove [find where comment~"guest:"]
+/ip firewall address-list remove [find where list=guest-blocked]
 
 /ip dhcp-server remove [find where name=guest-dhcp]
 /ip pool remove [find where name=guest-pool]
@@ -381,13 +436,23 @@ python3 wifi_qr.py --ssid "Guest-WiFi" --password "ВАШ_ПАРОЛЬ" -o guest
 /interface bridge remove [find where name=br-guest]
 ```
 
+> Если гость настраивался **на самом радио** (`wifi2` вместо виртуального AP, см. шаг 2), интерфейс `wifi-guest` не создавался — тогда верните `wifi2` к прежнему состоянию:
+>
+> ```rsc
+> /interface bridge port set [find interface=wifi2] bridge=bridge
+> /interface wifi set wifi2 !configuration !channel channel.skip-dfs-channels=10min-cac
+> /interface wifi set wifi2 disabled=no
+> ```
+
 ## Устранение неполадок
 
 | Проблема | Что проверить |
 |---|---|
 | Гость не получает IP | `br-guest` в списке `guest`; правила `guest: DHCP`; работает ли `/ip dhcp-server print where name=guest-dhcp` |
+| Гость получил IP, но **интернета нет**, DNS-таймауты | Включён ли `add-arp=yes` на `guest-dhcp` (шаг 1); `/ip arp print` — пуст ли для `br-guest`; `ping` до гостя **с роутера** (должен проходить). Симптом `arp=reply-only` без `add-arp` |
 | Нет интернета | NAT masquerade; правила `guest: internet ...`; `/ip dns print` и `allow-remote-requests` (шаг 6) |
-| Гость достучался до LAN | Порядок правил forward (шаг 4.2); не в списке ли `br-guest` в `LAN` |
+| Гость достучался до LAN | Порядок правил forward (шаг 4.2); не в списке ли `br-guest` в `LAN`; есть ли локальная подсеть в `guest-blocked` |
 | Скорость не ограничивается | Гостевой трафик всё ещё в FastTrack — правило `accept` в forward должно идти **выше** `fasttrack-connection`; метки в `/ip firewall mangle` |
 | Гость не подключается к Wi-Fi | Достигнут лимит 10 устройств (`/interface/wifi/registration-table print`); пароль ≥ 8 символов для WPA2; `country` задан; AP включён (`/interface/wifi print`) |
+| **SSID не виден ни одному устройству**, хотя радио `running` | Смотрите флаг интерфейса: `MBI` (inactive) = AP реально не вещает. Конфигом не лечится — помогает **заводской сброс / холодный старт** (перезагрузка по питанию); «мягкий» reboot может не помочь. Проверять видимость **несколькими** клиентами | 
 | Гость подключён, но без IP | Достигнут размер пула (`/ip dhcp-server lease print where server=guest-dhcp`); правила `guest: DHCP` |
